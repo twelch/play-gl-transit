@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8' />
+    <title>Cherriots Test</title>
+    <meta name='viewport' content='initial-scale=1,maximum-scale=1,user-scalable=no' />
+    <script src='https://api.tiles.mapbox.com/mapbox-gl-js/v0.44.1/mapbox-gl.js'></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@5/turf.min.js"></script>
+    <script src='data/agency.js'></script>
+    <script src='data/routes.js'></script>
+    <script src='data/shapes.geo.js'></script>
+    <script src='data/stops.geo.js'></script>
+    <script src='data/trips.js'></script>
+    <script src='data/stop_times.js'></script>
+    <script src='colorcolor.js'></script>
+    <script src='tinycolor.js'></script>
+
+    <link href='https://api.tiles.mapbox.com/mapbox-gl-js/v0.44.1/mapbox-gl.css' rel='stylesheet' />
+    <style>
+        body { margin:0; padding:0; }
+        #map { position:absolute; top:0; bottom:0; width:100%; }
+    </style>
+</head>
+<body>
+
+<div id='map'></div>
+<script>
+
+/**** GENERATE METADATA AND GEOJSON ****/
+
+var routeColl = {"type":"FeatureCollection","features":[]};
+var stopColl = {"type":"FeatureCollection","features":[]};
+
+routes.forEach((route) => {
+  route.route_id = parseInt(route.route_id) // Mutate
+  var route_color = `#${route.route_color}`
+  var route_fade_color = tinycolor(route_color).setAlpha(.1).toRgbString()
+
+  // Generate shape metadata from trips
+  route.shapes = trips
+  .filter(trip => {
+    trip.trip_id = parseInt(trip.trip_id) // Mutate
+    trip.route_id = parseInt(trip.route_id) // Mutate
+    trip.shape_id = parseInt(trip.shape_id) // Mutate
+    trip.direction_id = parseInt(trip.direction_id) // Mutate
+    // filter out trips with cur route ID
+    var match = trip.route_id === route.route_id
+    if (match) {
+      // Build up trip list
+      route.trips ? route.trips.push(trip.trip_id) : route.trips = []
+    }
+    return match
+  })
+  .map(trip => {
+    // whittle down properties
+    return {
+      'shape_id': trip.shape_id,
+      'direction_id': trip.direction_id,
+      'trip_id': trip.trip_id
+    }
+  })
+  .reduce((shapes, curShape) => {
+    // flatten to array of unique shape IDs with list of trip IDs
+    var shapeIndex = shapes.findIndex(shape => {
+      return shape.shape_id === curShape.shape_id && shape.direction_id === curShape.direction_id
+    })
+    if (shapeIndex >= 0) {
+      shapes[shapeIndex].trips.push(curShape['trip_id'])
+      return shapes
+    } else {
+      ({ trip_id, ...rest } = curShape)
+      var newShape = rest
+      newShape.trips = [curShape.trip_id]
+      shapes.push(newShape)
+      return shapes
+    }
+  }, [])
+
+  // Generate shape GeoJSON from metadata
+  route.shapes.forEach((shape) => {
+    // Create and append route-specific shape
+    var rawShape = shapesGeo.features.find((s) => {
+      return parseInt(s.properties.shape_id) === shape.shape_id;
+    });
+    var routeShape = Object.assign({}, rawShape, {
+      id: route.route_id // replace with route_id
+    });
+    routeShape.properties = Object.assign({}, {
+      direction_id: shape.direction_id,
+      shape_id: shape.shape_id, // replace with int value
+      route_color,
+      route_fade_color,
+      route_short_name: route.route_short_name,
+      route_long_name: route.route_long_name,
+    });
+    routeColl.features.push(routeShape);
+  });
+
+  route.stops = stopTimes
+  .filter(st => {
+    // filter out stop times for trips for this route
+    return route.trips.indexOf(parseInt(st.trip_id)) >= 0
+  })
+  .map(st => {
+    // whittle down properties
+    var tripIndex = route.trips.indexOf(parseInt(st['trip_id']))
+    return {
+      'stop_id': parseInt(st['stop_id']),
+      'direction_id': parseInt(trips[tripIndex]['direction_id'])
+    }
+  })
+  .reduce((stopDirs, curStopDir) => {
+    // flatten to array of unique stopDirs
+    var stopIndex = stopDirs.findIndex(stopDir => {
+      return stopDir.stop_id === curStopDir.stop_id && stopDir.direction_id === curStopDir.direction_id
+    })
+    if (stopIndex >= 0) {
+      return stopDirs
+    } else {
+      return [...stopDirs, curStopDir]
+    }
+  }, [])
+
+  route.stops.forEach((stop, index) => {
+    // Append stop list to each route
+    var rawStop = stopsGeo.features.find((s) => {
+      return parseInt(s.properties.stop_id) === stop.stop_id;
+    });
+    var routeStop = Object.assign({}, rawStop, {
+      id: index // replace with route_id
+    });
+    routeStop.properties = Object.assign({}, rawStop.properties, {
+      route_id: route.route_id,
+      direction_id: stop.direction_id,
+      stop_id: stop.stop_id, // replace with int value
+      route_color: `#${route.route_color}`
+    });
+    stopColl.features.push(routeStop);
+  })
+});
+
+/**** INITIALIZE STATE
+ *
+ *  view: int (VIEW)
+ *  route_id: int
+ *  route_dir: int
+ *  stop: int
+ * 
+ * DEFAULT_VIEW - show routes, hover highlights a route w/ label
+ *  onRouteEnter -> { route: id }
+ *  onRouteLeave -> { route: null }
+ *  onRouteClick: route ? -> { mode: ROUTE_VIEW, route: id }
+ * 
+ * ROUTE_VIEW - show route in one direction, unselected are faded back.  Selected route shows arrows and stops. Highlight stop with popup. fade back rest
+ *  onStopEnter -> { stop: id }
+ *  onStopLeave -> { stop: null }
+ *  onStopClick: stop ? -> { stop: id }
+ *  onDirectionChange -> { direction: !direction }
+ */
+
+const VIEW = { DEFAULT: 0, ROUTE: 1 }
+const DEFAULT_STATE = {
+  view: VIEW.DEFAULT,
+  route: null,
+  direction: 0,
+  route_highlight: null,
+  stop: null
+}
+let state = Object.assign({}, DEFAULT_STATE)
+
+var transitionTimes = {
+  routeFade: 300,
+  stop: 700,
+  redraw: 500
+}
+
+/**** DRAW MAP
+ * 
+ * Layer strategy
+ * 
+ * routes: full color, used to display full routes, and single hovered or selected route over faded routes,
+ * ensuring whole route can be seen.  Filter expression used to draw single route.
+ * routes-fade - subdued color, drawn underneath single hovered or selected route, otherwise not visible.
+ * 
+ * stops: faded in when route is selected, faded out when unselected.  Filter expression used to draw stops
+ * for currently selected route only.
+ * */
+
+mapboxgl.accessToken = 'pk.eyJ1IjoidHdlbGNoIiwiYSI6ImNqZW5vazRvcjEyczAyd25xamczMmh3OG0ifQ.vJy47O0vb1Z_F7OWIbZpyg';
+var map = new mapboxgl.Map({
+    container: 'map', // container id
+    style: 'mapbox://styles/twelch/cjenrahpz4ida2ss8opzrnt9d', // stylesheet location
+    center: [-123.032675, 44.936702], // starting position [lng, lat]
+    zoom: 11 // starting zoom
+});
+
+map.addControl(new mapboxgl.GeolocateControl({
+    positionOptions: {
+        enableHighAccuracy: true
+    }
+}));
+
+map.on('load', function () {
+
+  /**** ROUTES ****/
+
+  map.addSource("routes", {
+      type: "geojson",
+      data: routeColl
+  })
+
+  // Routes lines
+  map.addLayer({
+    "layout": {
+      "line-cap": "square",
+      "visibility": "visible"
+    },
+    "type": "line",
+    "source": "routes",
+    "id": "routes-buffer",
+    "paint": {
+      "line-blur": 1,
+      "line-width": {
+        "base": 1,
+        "stops": [
+          [8,30],
+          [12,12],
+          [14,24],
+          [18,42]
+        ],
+      },
+      "line-color": ['get', 'route_color'],
+      "line-opacity": 0.0
+    }
+  }, 'waterway-label');
+
+  // Routes lines
+  map.addLayer({
+    "layout": {
+      "line-cap": "round",
+      "line-join": "round",
+      "visibility": "visible"
+    },
+    "type": "line",
+    "source": "routes",
+    "id": "routes",
+    "paint": {
+      "line-blur": 1,
+      "line-width": {
+        "base": 1,
+        "stops": [
+          [8,2],
+          [12,3],
+          [14,6],
+          [18,14]
+        ],
+      },
+      "line-color": ['get', 'route_color']
+    }
+  }, 'waterway-label');
+
+  // Routes faded lines
+  map.addLayer({
+    "layout": {
+      "line-cap": "round",
+      "line-join": "round",
+      "visibility": "visible"
+    },
+    "type": "line",
+    "source": "routes",
+    "id": "routes-faded",
+    "paint": {
+      "line-blur": 1,
+      "line-width": {
+        "base": 1,
+        "stops": [
+          [8,0],
+          [12,3],
+          [14,6],
+          [18,14]
+        ],
+      },
+      "line-color": ['get', 'route_color'],
+      "line-opacity": 1,
+      "line-opacity-transition": {
+          "duration": transitionTimes.routeFade
+      }
+    }
+  }, 'routes');
+
+  // Routes arrows
+  map.addLayer({
+    "minzoom": 7,
+    "layout": {
+      "visibility": "none",
+      "icon-image": "triangle-11",
+      "icon-rotation-alignment": "map",
+      "symbol-placement": "line",
+      "symbol-spacing": 150,
+      "icon-rotate": 90,
+      "icon-size": {
+        "base": 1,
+        "stops": [         
+          [0, 0],
+          [9, 0.8],
+          [12, 1.0],
+          [14, 1.3],
+          [22, 1.6]
+        ]
+      }
+    },
+    "type": "symbol",
+    "source": "routes",
+    "id": "route-arrows",
+    "paint": {
+      "icon-opacity": 0,
+      "icon-opacity-transition": {
+          "duration": transitionTimes.stop,
+          "delay": 1000 // Delay arrow transition longer than stops because less important
+      },
+    }
+  }, 'waterway-label');
+
+  /**** STOPS ****/
+
+  map.addSource("stops", {
+      type: "geojson",
+      data: stopColl
+  })
+
+  // Stop circles
+  map.addLayer({
+    "layout": {
+      "visibility": "none" // start invisible
+    },
+    "minzoom": 7,
+    "type": "circle",
+    "source": "stops",
+    "id": "stops",
+    "paint": {
+      "circle-color": ['get', 'route_color'],
+      "circle-stroke-color": "hsl(55, 11%, 96%)",
+      "circle-stroke-opacity": 0,
+      "circle-stroke-opacity-transition": {duration: transitionTimes.stop},
+      "circle-opacity": 0,
+      "circle-opacity-transition": {duration: transitionTimes.stop},
+      "circle-radius": {
+        "base": 1,
+        "stops": [
+          [8, 4],
+          [9, 5],
+          [10, 6],
+          [13, 8],
+          [15, 10],
+          [18, 14]
+        ]
+      },
+      "circle-stroke-width": {
+        "base": 1,
+        "stops": [
+          [9, 1.5],
+          [10, 2],
+          [13, 3],
+          [15, 4.5],
+          [18, 5]
+        ]
+      }
+    }
+  }, 'place-city-sm')
+
+  /**** EVENT HANDLERS ****/
+
+  // Map click
+  map.on('click', (e) => {
+    const features = map.queryRenderedFeatures(e.point, { layers: ['routes-buffer','stops'] })
+    // Handle click outside of feature
+    if (features.length === 0) {
+      if (state.view === VIEW.ROUTE) {
+        update(DEFAULT_STATE)
+      }
+    }
+  })
+
+  // Route click
+  map.on('click', 'routes-buffer', function (e) {
+    var clickedRoute = e.features[0]
+    update({ 
+      view: VIEW.ROUTE,
+      route: clickedRoute.id,
+      route_highlight: clickedRoute.id,
+      direction: clickedRoute.properties.direction_id // Default to direction of route segment clicked or whichever was on top
+    })
+    var description = `<b>${clickedRoute.properties['route_short_name']} - ${clickedRoute.properties['route_long_name']}</b> <br/> <sm>Direction: ${clickedRoute.properties['direction_id']}`
+    addPopup(description, e.lngLat)
+  })
+
+  // Route hover
+  map.on('mouseenter', 'routes-buffer', function (e) {
+    if (state.view === VIEW.DEFAULT && e.features.length > 0) {
+      var route = e.features[0]
+      map.getCanvas().style.cursor = 'pointer'
+      update({ route_highlight: route.id })
+    }
+  });
+  map.on('mouseleave', 'routes-buffer', function (e) {
+    if (state.view === VIEW.DEFAULT) {
+      update({ route_highlight: null })
+    }
+    map.getCanvas().style.cursor = ''
+  });
+
+  // Stop click
+  map.on('click', 'stops', function (e) {
+    if (state.view === VIEW.ROUTE && e.features.length > 0) {
+      var stop = e.features[0]
+      var description = `${stop.properties['stop_id']} - ${stop.properties['stop_name']}<br/><a href='#'>View this Stop</a><br/>${JSON.stringify(stop.properties)}`
+      addPopup(description, e.lngLat)
+      update({ stop: stop.id })
+    }
+  });
+
+  // Stop hover
+  map.on('mouseenter', 'stops', function () {
+      map.getCanvas().style.cursor = 'pointer'
+  });
+  map.on('mouseleave', 'stops', function () {
+      map.getCanvas().style.cursor = ''
+  });
+
+});
+
+/**** FUNCTIONS ****/
+
+const addPopup = (description, loc) => {
+  new mapboxgl.Popup()
+    .setLngLat(loc)
+    .setHTML(description)
+    .addTo(map);
+}
+
+const update = (newState) => {
+  state = Object.assign({}, state, newState)
+  console.log('update', state)
+
+  updateHighlight()
+
+  if (state.view === VIEW.DEFAULT) {
+    // Hide and reset arrows
+    map.setLayoutProperty('route-arrows', 'visibility', 'none')
+    map.setFilter('route-arrows',['all'])
+    map.setPaintProperty('route-arrows', 'icon-opacity', 0)
+
+    // Fade out stops, then hide
+    map.setPaintProperty('stops', 'circle-opacity', 0)
+    map.setPaintProperty('stops', 'circle-stroke-opacity', 0)
+    setTimeout(() => {
+      // Make sure view hasn't changed while waiting (race condition)
+      if (state.view === VIEW.DEFAULT) {
+        map.setLayoutProperty('stops', 'visibility', 'none')
+      }
+    }, transitionTimes.stop)
+  }
+
+  if (state.view === VIEW.ROUTE) {
+    // Filter to selected route
+    map.setFilter('stops', [
+      'all',
+      ["==", ['get', 'route_id'], state.route],
+      ["==", ['get', 'direction_id'], state.direction]
+    ])
+    map.setFilter('route-arrows', [
+      'all',
+      ["==", ['id'], state.route],
+      ["==", ['get', 'direction_id'], state.direction]
+    ])
+
+    // Show hidden
+    map.setLayoutProperty('stops', 'visibility', 'visible')
+    map.setLayoutProperty('route-arrows', 'visibility', 'visible')
+    
+    // Fade in
+    map.setPaintProperty('stops', 'circle-opacity', 1)
+    map.setPaintProperty('stops', 'circle-stroke-opacity', 1)
+    map.setPaintProperty('route-arrows', 'icon-opacity', 1)
+
+    // Fit route
+    fitLine(routeColl.features.filter(route => route.id === state.route))
+  }
+}
+
+const updateHighlight = (filterDirection) => {
+  if (state.route || state.route_highlight) {
+    // Fade and filter routes
+    if (state.view === VIEW.DEFAULT) {
+      map.setFilter('routes', 
+        ["==", ['id'], state.route || state.route_highlight]
+      )
+    } else if (state.view === VIEW.ROUTE) {
+      map.setFilter('routes', [
+        'all',
+        ["==", ['id'], state.route || state.route_highlight],
+        ["==", ['get', 'direction_id'], state.direction]
+      ])
+    }
+    
+    map.setPaintProperty('routes-faded', 'line-opacity', .14)
+  } else {
+    // Unfade then unfilter routes
+    map.setPaintProperty('routes-faded', 'line-opacity', 1)
+    setTimeout(() => {
+      // Make sure highlight hasn't changed while waiting (race condition)
+      if (state.route_highlight === null) {
+        map.setFilter('routes',['all'])
+      }
+    }, transitionTimes.routeFade)
+  }
+}
+
+const fitLine = (lines) => {
+  if (!lines || lines.length < 1) return
+  // Seed initial point
+  var bounds = new mapboxgl.LngLatBounds(lines[0].geometry.coordinates[0], lines[0].geometry.coordinates[0])
+  // Iterate through every line coordinate extending bounds outward to fit
+  lines.forEach(line => {
+    line.geometry.coordinates.forEach(coord => {
+        bounds.extend(coord)
+    })
+  })
+  map.fitBounds(bounds, {
+      padding: 30,
+      speed: 0.6
+  });
+}
+
+</script>
+
+</body>
+</html>
